@@ -1,0 +1,289 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+#
+# Stolostron org-wide CodeRabbit configuration.
+# Applies to all stolostron repos without their own .coderabbit.yaml.
+# Repos with their own config must set `inheritance: true` to merge with this.
+# See: https://docs.coderabbit.ai/configuration/central-configuration
+
+language: en-US
+early_access: false
+enable_free_tier: false
+
+reviews:
+  profile: chill
+  request_changes_workflow: false
+  high_level_summary: true
+  poem: false
+  in_progress_fortune: false
+  review_status: true
+  collapse_walkthrough: false
+
+  path_filters:
+    - "!**/vendor/**"
+    - "!vendor/**"
+    - "!**/zz_generated*"
+    - "!boilerplate/**"
+    # yarn.lock excluded: high churn, low signal — package.json changes are
+    # reviewed by the supply-chain block. Other dependency locks (go.sum,
+    # package-lock.json) are deliberately kept so the supply-chain
+    # path_instructions block fires on them.
+    - "!yarn.lock"
+    - "!node_modules/**"
+    - "!dist/**"
+    - "!*.min.js"
+
+  pre_merge_checks:
+    custom_checks:
+      - name: "Stable and Deterministic Test Names"
+        mode: error
+        instructions: |
+          Ginkgo test names MUST be stable and deterministic. They must never contain
+          dynamic information that changes between runs.
+
+          Flag any test title (It(), Describe(), Context(), When(), etc.) that includes:
+          - Pod names with generated suffixes (e.g., "test-pod-abc123")
+          - Timestamps or dates
+          - Random UUIDs or generated identifiers
+          - Node or namespace names with random suffixes
+          - IP addresses
+          - Any value that could change between test runs
+
+          ❌ Bad examples:
+          - `It("should create pod test-pod-xyz123 in namespace test-ns-abc")`
+          - `It(fmt.Sprintf("should run on cluster %s", clusterName))`
+          - `It("should complete within " + timeout.String())`
+
+          ✅ Good examples:
+          - `It("should create a pod with the expected security context")`
+          - `It("should propagate labels to the managed cluster")`
+          - `It("should complete initialization quickly")`
+
+          Dynamic values belong in test BODIES (assertions, setup), never in test TITLES.
+
+      - name: "Test Structure and Quality"
+        mode: warning
+        instructions: |
+          Review Go test code for these quality requirements:
+
+          1. **Single responsibility**: Each test (It block or Test* function) should
+             test one specific behavior. Flag tests that assert multiple unrelated behaviors.
+
+          2. **Setup and cleanup**: Tests should use BeforeEach/AfterEach (Ginkgo) or
+             t.Cleanup (testify) for setup and cleanup. Flag tests that create
+             cluster-scoped resources without cleanup.
+
+          3. **Timeouts on async operations**: Operations that interact with the cluster
+             or wait for conditions must have explicit timeouts.
+             ❌ `Eventually(func() bool { ... }).Should(BeTrue())`
+             ✅ `Eventually(func() bool { ... }, 30*time.Second, 1*time.Second).Should(BeTrue())`
+
+          4. **Assertion messages**: Assertions should include meaningful failure messages.
+             ❌ `Expect(err).NotTo(HaveOccurred())`
+             ✅ `Expect(err).NotTo(HaveOccurred(), "failed to create ManagedCluster")`
+             ❌ `require.NoError(t, err)`
+             ✅ `require.NoError(t, err, "expected ManagedCluster creation to succeed")`
+
+          5. **Unit test isolation**: Unit tests must use controller-runtime fake.Client,
+             not real K8s API servers. Flag any test that dials an external endpoint
+             without a mock or fake.
+
+      - name: "no-weak-crypto"
+        instructions: |
+          Flag MD5, SHA1, DES, RC4, 3DES, Blowfish, ECB mode usage.
+          Flag custom crypto implementations. Flag non-constant-time
+          comparison of secrets or tokens.
+        mode: "error"
+
+      - name: "container-privileges"
+        instructions: |
+          Flag privileged: true, hostPID, hostNetwork, hostIPC,
+          SYS_ADMIN capability, running as root without justification,
+          allowPrivilegeEscalation: true in container/K8s manifests.
+        mode: "error"
+
+      - name: "no-sensitive-data-in-logs"
+        instructions: |
+          Flag logging that may expose passwords, tokens, API keys,
+          PII (email, SSN, credit card), session IDs, internal
+          hostnames, or customer data.
+        mode: "error"
+
+  path_instructions:
+
+    # ── Injection & input validation ─────────────────────────────────────────
+    # Skills: input-validation-injection
+    - path: "**/*.{go,py,js,ts}"
+      instructions: |
+        Injection prevention (prodsec-skills):
+        - Command injection: no exec.Command with unsanitized user input; no shell=True in Python
+        - Path traversal: canonicalize paths, reject ../
+        - Deserialization: no yaml.Unmarshal into interface{} from untrusted data; no pickle/eval
+        - Validate at trust boundaries with allow-lists, not deny-lists
+        - Normalize Unicode and anchor regexes (^$); watch for ReDoS
+
+    # ── Web & frontend security ───────────────────────────────────────────────
+    # Skills: web-application-security, client-side-security
+    - path: "**/*.{html,jsx,tsx}"
+      instructions: |
+        Web security (prodsec-skills):
+        - No dangerouslySetInnerHTML or v-html with user data
+        - CSP: no unsafe-inline, no unsafe-eval
+        - CSRF tokens on state-changing requests
+        - Cookies: Secure, HttpOnly, SameSite=Strict
+        - No document.write, eval, new Function with user input
+
+    # ── Cryptography ─────────────────────────────────────────────────────────
+    # Skills: algorithm-selection, constant-time-analysis
+    - path: "**/*{crypt,cipher,sign,hash,tls,ssl,cert,key,token}*"
+      instructions: |
+        Cryptographic security (prodsec-skills):
+        - Banned: MD5, SHA1, DES, RC4, 3DES, Blowfish, ECB mode
+        - Symmetric: AES-256-GCM or ChaCha20-Poly1305
+        - Constant-time comparison for all secret/token data
+        - Use stdlib crypto/* and golang.org/x/crypto; no third-party crypto libraries
+        - No custom crypto implementations
+
+    # ── Container & image hardening ──────────────────────────────────────────
+    # Skills: container-hardening
+    - path: "**/{Dockerfile,Containerfile}*"
+      instructions: |
+        Container security (prodsec-skills):
+        - Base image: UBI minimal (ubi8/ubi9) from registry.access.redhat.com or
+          registry.ci.openshift.org; pin non-RH images by digest
+        - Multi-stage builds; no build tools in final image
+        - USER non-root; never run as root (stolostron convention: UID 1001 or 65532)
+        - COPY specific files, not entire context
+        - No secrets in ENV, ARG, or COPY
+        - No package manager cache in final layer
+
+    # ── Kubernetes & OpenShift manifests ─────────────────────────────────────
+    # Skills: scc-security, operator-security, health-probes
+    - path: "**/*.{yaml,yml}"
+      instructions: |
+        If this is a Kubernetes/OpenShift manifest or Helm/Kustomize template:
+        - securityContext: runAsNonRoot, readOnlyRootFilesystem,
+          allowPrivilegeEscalation: false
+        - Drop ALL capabilities, add only what is required
+        - Resource limits (cpu, memory) on every container
+        - No hostPID, hostNetwork, hostIPC, privileged: true
+        - Liveness + readiness probes defined
+        - automountServiceAccountToken: false unless needed
+        - RBAC: least privilege; no cluster-admin for workloads
+
+    # ── Supply chain & dependencies ───────────────────────────────────────────
+    # Skills: supply-chain-risk-auditor
+    - path: "**/{go.mod,go.sum,requirements*.txt,pyproject.toml,package*.json}"
+      instructions: |
+        Supply chain security (prodsec-skills):
+        - New deps: justify need, check license compatibility (Apache 2.0 / MIT preferred)
+        - Flag known CVEs (cross-ref osv.dev)
+        - No pre-release or yanked versions in production
+        - go.sum entries must correspond to entries in go.mod
+
+    # ── CI/CD & GitHub Actions ────────────────────────────────────────────────
+    # Skills: secure-pipeline, build-yaml-misconfiguration
+    - path: ".github/workflows/**/*"
+      instructions: |
+        CI/CD security (prodsec-skills):
+        - Pin actions by full SHA, not tag
+        - No secrets in logs; mask sensitive outputs
+        - Least privilege: minimize GITHUB_TOKEN permissions
+        - No pull_request_target with checkout of PR head
+        - SAST/SCA steps in pipeline
+
+    # ── Go ────────────────────────────────────────────────────────────────────
+    # Skills: go-security
+    - path: "**/*.go"
+      instructions: |
+        Go standards (prodsec-skills + stolostron conventions):
+        - Never ignore error returns; wrap with fmt.Errorf("context: %w", err)
+        - Use stdlib crypto/* and golang.org/x/crypto; avoid third-party crypto libraries
+        - Integer overflow: bounds-check user-supplied sizes before slice/buffer allocation
+        - context.Context for cancellation and timeouts on all K8s API calls
+        - No fmt.Sprintf in log messages; use structured logging (key-value pairs)
+        - Copyright header required: Apache 2.0 with "Red Hat, Inc." or "stolostron contributors"
+
+    # ── Controller-runtime reconciler patterns ────────────────────────────────
+    - path: "**/{controllers,controller,reconciler}/**/*.go"
+      instructions: |
+        Controller-runtime reconciler patterns (stolostron):
+        - Reconcile errors must be returned (ctrl.Result{}, err); never swallowed silently
+        - RBAC annotations (+kubebuilder:rbac:groups=...) required for any new API access
+        - Prefer cache reads (client.Get/List) over direct API server calls in hot path
+        - Use patch (client.Patch) over update (client.Update) to avoid resource version conflicts
+        - Requeue with backoff on transient errors; do not requeue on permanent/terminal errors
+        - Status conditions must follow Kubernetes API conventions:
+          LastTransitionTime, Reason, Message, ObservedGeneration
+
+    # ── API type definitions ──────────────────────────────────────────────────
+    - path: "**/api/**/*.go"
+      instructions: |
+        API type definitions (stolostron):
+        - All root types must have +kubebuilder:object:root=true
+        - Validation markers (+kubebuilder:validation:*) required on all spec fields
+        - New optional fields must have omitempty JSON tag
+        - Status subresource fields must not be written via spec
+        - New CRD API versions require a conversion strategy (hub/spoke or webhook)
+
+    # ── Test code ─────────────────────────────────────────────────────────────
+    - path: "**/*_test.go"
+      instructions: |
+        Test quality (stolostron):
+        - Unit tests: use controller-runtime fake.Client; never dial real K8s API servers
+        - Ginkgo: test titles must be static strings — no fmt.Sprintf, no variable interpolation
+        - Ginkgo: BeforeEach/AfterEach or DeferCleanup required for resource setup/teardown
+        - Ginkgo: Eventually/Consistently must have explicit timeout and polling interval
+        - Testify: use require.* (not assert.*) for setup steps that must not continue on failure
+        - Both: assertion messages must explain what was expected and why it matters
+        - Both: cluster-scoped resources must be cleaned up; leaked resources cause flaky tests
+
+  # Taken from prodsec suggested configuration: https://github.com/RedHatProductSecurity/prodsec-skills/blob/main/.coderabbit.yaml
+  tools:
+    # golangci-lint is intentionally disabled at the org level to avoid breaking
+    # existing repos that have not yet tuned their .golangci.yml configuration.
+    # To enable for a single repo, add to that repo's .coderabbit.yaml:
+    #   tools:
+    #     golangci-lint:
+    #       enabled: true
+    # Once the majority of Go repos have a .golangci.yml in place, enable globally here.
+    golangci-lint:
+      enabled: false
+    semgrep:
+      enabled: true
+    gitleaks:
+      enabled: true
+    trivy:
+      enabled: true
+    osvScanner:
+      enabled: true
+    checkov:
+      enabled: true
+    hadolint:
+      enabled: true
+    yamllint:
+      enabled: true
+    markdownlint:
+      enabled: true
+    actionlint:
+      enabled: true
+    shellcheck:
+      enabled: true
+    ast-grep:
+      essential_rules: true
+
+chat:
+  auto_reply: true
+  art: false
+
+knowledge_base:
+  opt_out: false
+  code_guidelines:
+    enabled: true
+    filePatterns:
+      - "**/AGENTS.md"
+      - "**/CLAUDE.md"
+      - "**/CONTRIBUTING.md"
+  issues:
+    scope: "auto"
+  pull_requests:
+    scope: "auto"
